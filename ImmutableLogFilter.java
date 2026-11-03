@@ -75,6 +75,14 @@ public class ImmutableLogFilter extends OncePerRequestFilter {
     ) {
         try {
             int status = res.getStatus();
+            // An exception that escapes the chain has not become a response yet: the container
+            // answers it with 500, overriding any status set before the throw (sendError()
+            // included — it marks the response committed, but the 4xx/5xx is replaced too).
+            // Only a response already flushed with a non-error status keeps it. Exceptions
+            // resolved by @ExceptionHandler/@ResponseStatus never get here.
+            if (ex != null && (!res.isCommitted() || status >= 400)) {
+                status = HttpServletResponse.SC_INTERNAL_SERVER_ERROR;
+            }
             String method = req.getMethod();
             String path = req.getRequestURI();
             String requestId = UUID.randomUUID().toString();

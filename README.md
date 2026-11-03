@@ -1,8 +1,10 @@
 # ImmutableLog Spring Boot Filter
 
-Filtro Spring Boot que captura automaticamente todas as requisições HTTP — erros, sucessos e exceções não tratadas — e envia eventos de auditoria imutáveis para o ImmutableLog.
+Filtro Spring Boot que captura automaticamente todas as requisições HTTP — erros, sucessos e exceções não tratadas —, exceto `/health`, `/actuator/health` e `/ping` (ver [Exclusão de paths](#exclusão-de-paths)), e envia eventos de auditoria imutáveis para o ImmutableLog.
 
-Usa `OncePerRequestFilter` + `HttpClient.sendAsync()` (Java 11+). Fire-and-forget — nunca bloqueia a resposta ao cliente.
+Usa `OncePerRequestFilter` + `HttpClient.sendAsync()`. Fire-and-forget — o envio ao ImmutableLog não espera resposta (ver [Limitações conhecidas](#limitações-conhecidas)).
+
+**Requisitos:** Spring Boot 3 / Spring Framework 6 — o filtro importa `jakarta.servlet` (não `javax.servlet`), e o Spring Boot 3 exige Java 17+.
 
 ---
 
@@ -31,14 +33,19 @@ implementation 'com.fasterxml.jackson.core:jackson-databind'
 
 ## Adicionar ao projeto
 
-Copie `ImmutableLogFilter.java` para dentro do seu projeto:
+Copie `ImmutableLogFilter.java` para dentro do seu projeto, por exemplo:
 
 ```
 src/main/java/com/example/filter/ImmutableLogFilter.java
-src/main/java/com/example/config/ImmutableLogFilter.java
 ```
 
-O Spring Boot detecta o `@Component` e registra o filtro automaticamente — sem nenhuma configuração extra.
+O arquivo **não tem declaração `package`** (ele começa direto nos `import`). Ao copiar, acrescente na primeira linha o pacote da pasta onde ele ficou:
+
+```java
+package com.example.filter;
+```
+
+O Spring Boot detecta o `@Component` e registra o filtro sem configuração extra **desde que o pacote esteja sob o component scan da aplicação** — por padrão, o pacote da classe anotada com `@SpringBootApplication` e os subpacotes dele. Uma classe no pacote default (sem `package`) não é alcançada pelo component scan padrão.
 
 ---
 
@@ -81,8 +88,8 @@ immutablelog:
 |-----------------------------|---------------------------------------------------------------------------|
 | Wrapping da requisição      | `ContentCachingRequestWrapper` e `ResponseWrapper` para leitura do body   |
 | `chain.doFilter()`          | Requisição flui normalmente para o controller                             |
-| `finally` + `sendAsync()`   | Evento montado e enviado de forma assíncrona após a resposta              |
-| Hash do body                | SHA-256 do body — nunca o conteúdo bruto é enviado ao ImmutableLog        |
+| `finally` + `sendAsync()`   | Depois do `chain.doFilter()`, o evento é montado na thread da requisição e enviado com `sendAsync()`; só então o body da resposta é copiado para o cliente |
+| Hash do body                | SHA-256 do body, quando houver bytes em cache (só o que a aplicação leu) — nunca o conteúdo bruto é enviado ao ImmutableLog |
 
 ---
 
@@ -108,17 +115,20 @@ public class PaymentController {
 
 ## Exclusão de paths
 
+O filtro já vem com esta lista fixa no código:
+
 ```java
 private static final Set<String> SKIP_PATHS = Set.of(
-    "/health", "/actuator/health", "/actuator/info", "/ping"
+    "/health", "/actuator/health", "/ping"
 );
 
 @Override
 protected boolean shouldNotFilter(HttpServletRequest request) {
-    String path = request.getRequestURI();
-    return SKIP_PATHS.stream().anyMatch(path::startsWith);
+    return SKIP_PATHS.contains(request.getRequestURI());
 }
 ```
+
+A comparação é **exata** com `request.getRequestURI()`, não por prefixo: `/actuator/health/liveness`, `/actuator/info` e `/health/` (com barra no fim) são auditados normalmente. Para mudar a lista, edite `SKIP_PATHS` no arquivo copiado.
 
 ---
 
@@ -155,10 +165,30 @@ protected boolean shouldNotFilter(HttpServletRequest request) {
 
 | Situação                           | Resultado                                               |
 |------------------------------------|---------------------------------------------------------|
-| `apiKey` vazio                     | Filtro registrado, mas evento não enviado               |
+| `apiKey` vazio                     | O filtro não confere a chave: o evento é enviado mesmo assim, com `Authorization: Bearer ` vazio |
 | Path em `SKIP_PATHS`               | Evento ignorado, requisição prossegue normalmente       |
 | Status 2xx                         | `type: success`                                         |
 | Status 3xx                         | `type: info`                                            |
 | Status 4xx / 5xx                   | `type: error`                                           |
-| Exceção não tratada                | `type: error` com `exception.type` e `exception.message` |
+| Exceção não tratada que chega ao filtro | `status`/`http_status` = `500` e `type: error` — o status que o container responde, mesmo que a aplicação tenha chamado `setStatus()`/`sendError()` antes do `throw`. Só uma resposta já enviada ao cliente com status < 400 mantém esse status. Vão também `meta.error_type` e `meta.error_message` (até 500 caracteres) e `error` (`type`, `message`, `retryable`) no payload; a exceção é relançada |
+| Exceção tratada por `@ExceptionHandler`/`@ControllerAdvice`, `@ResponseStatus` ou `ResponseStatusException` | Não chega ao filtro: o evento sai com o status real da resposta (ex.: 422, 404, 409) e **sem** `error_type`/`error_message`/`error` |
+| Rota inexistente                   | `404`, `type: error`; `http_route` sai como `/**` (o padrão do handler de recursos estáticos do Spring Boot), não o caminho |
+| Requisição com body que a aplicação não lê | Evento normal, sem `request_body_hash` (o wrapper só guarda o que foi lido) |
 | Falha no `sendAsync`               | Exceção silenciada — nunca quebra a aplicação           |
+
+> **Cópias antigas do filtro** (anteriores a esta correção) continuam registrando exceção não tratada como `status: 200` / `type: success` junto de `error_type` até o arquivo ser copiado de novo.
+
+---
+
+## Limitações conhecidas
+
+- **`client_ip` vem de header, sem validação.** O filtro usa o primeiro item de `X-Forwarded-For`; sem ele, `X-Real-IP`; sem os dois, `request.getRemoteAddr()`. Nenhum dos headers é validado, então quem chama a aplicação diretamente (sem um proxy que sobrescreva esses headers) pode forjar o IP registrado.
+- **`Idempotency-Key` é um UUID aleatório gerado pelo filtro a cada requisição**, o mesmo valor de `meta.request_id`. Não vem de nenhum header da requisição de entrada.
+- **Entrega sem garantia.** Um único `sendAsync()` por evento: sem timeout configurado, sem retry, sem fila. A resposta do ImmutableLog é descartada e qualquer erro (rede, status 4xx/5xx, falha ao montar o evento) é ignorado em silêncio — o evento simplesmente se perde.
+- **Sem suporte a trilha (`immutable_trail`):** o filtro não envia nenhum campo de trilha.
+- **Chaves reservadas enviadas em `meta`:** `service`, `environment` (e `env`), `http_method`, `http_status`, `http_route` e `log_level` sempre; `client_ip` quando resolvido; `error_type` e `error_message` só quando uma exceção chega ao filtro. Todos são strings.
+- **`status`** no payload é o código HTTP numérico lido da resposta no fim do filtro (ou `500` quando uma exceção não tratada atravessa o filtro, ver [Comportamento](#comportamento)); `meta.http_status` é o mesmo valor como string.
+- **`error_type` é a exceção que chega ao filtro, não a causa original.** No Spring MVC 6 o `DispatcherServlet` embrulha a exceção do controller: `error_type` sai `jakarta.servlet.ServletException` e `error_message` sai `Request processing failed: java.lang.RuntimeException: boom`. Pelo mesmo motivo `error.retryable` sai `true` mesmo para `IllegalArgumentException`.
+- **Endpoints assíncronos do Spring MVC perdem o body da resposta com este filtro** — visto com `Callable` e `DeferredResult`; `WebAsyncTask`, `SseEmitter` e `StreamingResponseBody` usam o mesmo despacho assíncrono e não foram testados. Vale para todas as versões do filtro. O filtro roda só no primeiro dispatch, copia o body (ainda vazio) quando o controller devolve o `Callable` e não está presente quando o resultado é escrito: o cliente recebe `200` com body vazio, e o evento sai com `200` antes de o resultado existir. Não use o filtro em aplicação com endpoints assíncronos.
+- **O caminho concreto vai no evento.** `path` no payload e o `event_name` padrão usam `request.getRequestURI()` (sem query string), com os IDs que estiverem na URL. O evento selado não pode ser apagado depois.
+- **O hash do body é SHA-256 sem sal.** Não expõe o conteúdo, mas um body previsível pode ser confirmado comparando o hash.
