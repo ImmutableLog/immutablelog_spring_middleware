@@ -155,7 +155,7 @@ A comparação é **exata** com `request.getRequestURI()`, não por prefixo: `/a
 
 > `env` é mantido por compatibilidade; `environment` é o nome canônico do contrato
 > (`CONTRACT.md` §4.1 do `immutablelog_siem`). `client_ip`, `error_type` e `error_message`
-> só aparecem quando o valor existe (IP resolvido, exceção capturada).
+> só aparecem quando o valor existe (IP válido, exceção capturada). Sem IP válido, `client_ip` sai também do payload.
 
 > O campo `payload` é uma **string JSON serializada** — não um objeto.
 
@@ -182,11 +182,11 @@ A comparação é **exata** com `request.getRequestURI()`, não por prefixo: `/a
 
 ## Limitações conhecidas
 
-- **`client_ip` vem de header, sem validação.** O filtro usa o primeiro item de `X-Forwarded-For`; sem ele, `X-Real-IP`; sem os dois, `request.getRemoteAddr()`. Nenhum dos headers é validado, então quem chama a aplicação diretamente (sem um proxy que sobrescreva esses headers) pode forjar o IP registrado.
+- **`client_ip` vem primeiro de headers que o chamador controla.** O filtro usa o primeiro item de `X-Forwarded-For` se ele for um IP válido; senão, `X-Real-IP` se for um IP válido; senão, `request.getRemoteAddr()`, também validado; senão, nenhum. Quem chama a aplicação diretamente (sem um proxy que sobrescreva esses headers) pode forjar o IP registrado, desde que mande um IP válido. Antes de validar, o valor passa por `trim` e perde a porta (`10.0.0.1:8080`, `[2001:db8::1]:8080`) e os colchetes. A validação não faz consulta DNS: IPv4 é conferido por expressão regular, e só chega ao `InetAddress.getByName` um valor com `:` feito apenas de dígitos hexadecimais, `:` e `.`, que ele interpreta como literal IPv6. Sem IP válido, `client_ip` não vai nem no `meta` nem no payload.
 - **`Idempotency-Key` é um UUID aleatório gerado pelo filtro a cada requisição**, o mesmo valor de `meta.request_id`. Não vem de nenhum header da requisição de entrada.
 - **Entrega sem garantia.** Um único `sendAsync()` por evento: sem timeout configurado, sem retry, sem fila. A resposta do ImmutableLog é descartada e qualquer erro (rede, status 4xx/5xx, falha ao montar o evento) é ignorado em silêncio — o evento simplesmente se perde.
 - **Sem suporte a trilha (`immutable_trail`):** o filtro não envia nenhum campo de trilha.
-- **Chaves reservadas enviadas em `meta`:** `service`, `environment` (e `env`), `http_method`, `http_status`, `http_route` e `log_level` sempre; `client_ip` quando resolvido; `error_type` e `error_message` só quando uma exceção chega ao filtro. Todos são strings.
+- **Chaves reservadas enviadas em `meta`:** `service`, `environment` (e `env`), `http_method`, `http_status`, `http_route` e `log_level` sempre; `client_ip` só quando há IP válido (de `X-Forwarded-For`, `X-Real-IP` ou da conexão); `error_type` e `error_message` só quando uma exceção chega ao filtro. Todos são strings.
 - **`status`** no payload é o código HTTP numérico lido da resposta no fim do filtro (ou `500` quando uma exceção não tratada atravessa o filtro, ver [Comportamento](#comportamento)); `meta.http_status` é o mesmo valor como string.
 - **`error_type` é a exceção que chega ao filtro, não a causa original.** No Spring MVC 6 o `DispatcherServlet` embrulha a exceção do controller: `error_type` sai `jakarta.servlet.ServletException` e `error_message` sai `Request processing failed: java.lang.RuntimeException: boom`. Pelo mesmo motivo `error.retryable` sai `true` mesmo para `IllegalArgumentException`.
 - **Endpoints assíncronos do Spring MVC perdem o body da resposta com este filtro** — visto com `Callable` e `DeferredResult`; `WebAsyncTask`, `SseEmitter` e `StreamingResponseBody` usam o mesmo despacho assíncrono e não foram testados. Vale para todas as versões do filtro. O filtro roda só no primeiro dispatch, copia o body (ainda vazio) quando o controller devolve o `Callable` e não está presente quando o resultado é escrito: o cliente recebe `200` com body vazio, e o evento sai com `200` antes de o resultado existir. Não use o filtro em aplicação com endpoints assíncronos.

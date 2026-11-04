@@ -9,12 +9,14 @@ import org.springframework.web.util.ContentCachingRequestWrapper;
 import org.springframework.web.util.ContentCachingResponseWrapper;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.http.*;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.*;
+import java.util.regex.Pattern;
 
 @Component
 public class ImmutableLogFilter extends OncePerRequestFilter {
@@ -98,12 +100,15 @@ public class ImmutableLogFilter extends OncePerRequestFilter {
                 : status >= 300 ? "info"
                 : "success";
 
+            // Bare IP (no port) or null; when null, client_ip is left out of payload and meta.
+            String clientIp = getClientIp(req);
+
             Map<String, Object> payloadMap = new LinkedHashMap<>();
             payloadMap.put("method", method);
             payloadMap.put("path", path);
             payloadMap.put("status", status);
             payloadMap.put("latency_ms", latencyMs);
-            payloadMap.put("client_ip", getClientIp(req));
+            if (clientIp != null) payloadMap.put("client_ip", clientIp);
             payloadMap.put("user_agent", req.getHeader("User-Agent"));
 
             byte[] body = req.getContentAsByteArray();
@@ -138,11 +143,8 @@ public class ImmutableLogFilter extends OncePerRequestFilter {
             meta.put("log_level", logLevelFrom(type));
 
             // client_ip has to travel in meta (not only in the payload) so the platform can
-            // promote it to source.ip; "unknown" is not an IP, so it is not worth sending.
-            String clientIp = getClientIp(req);
-            if (clientIp != null && !clientIp.isBlank() && !clientIp.equals("unknown")) {
-                meta.put("client_ip", clientIp);
-            }
+            // promote it to source.ip. Only a bare IP is promoted, so nothing else is sent.
+            if (clientIp != null) meta.put("client_ip", clientIp);
 
             if (ex != null) {
                 meta.put("error_type", ex.getClass().getName());
@@ -204,12 +206,52 @@ public class ImmutableLogFilter extends OncePerRequestFilter {
         return value.length() > max ? value.substring(0, max) : value;
     }
 
+    /**
+     * Client IP for client_ip: the first X-Forwarded-For entry, else X-Real-IP, else the IP of
+     * the connection (getRemoteAddr()), taking the first one that is a valid IP. Returns null
+     * when none is. X-Forwarded-For and X-Real-IP are only trustworthy behind a proxy/ALB that
+     * overwrites them: without one, any caller can forge them.
+     */
     private String getClientIp(HttpServletRequest req) {
         String xff = req.getHeader("X-Forwarded-For");
-        if (xff != null && !xff.isBlank()) return xff.split(",")[0].trim();
-        String xri = req.getHeader("X-Real-IP");
-        if (xri != null && !xri.isBlank()) return xri;
-        return req.getRemoteAddr();
+        if (xff != null) {
+            String ip = bareIp(xff.split(",")[0]);
+            if (ip != null) return ip;
+        }
+        String xri = bareIp(req.getHeader("X-Real-IP"));
+        if (xri != null) return xri;
+        return bareIp(req.getRemoteAddr());
+    }
+
+    private static final Pattern IPV4 = Pattern.compile(
+        "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}");
+    private static final Pattern IPV6_CHARS = Pattern.compile("[0-9A-Fa-f:.]+");
+
+    /**
+     * Trims v, strips a port ("10.0.0.1:8080", "[2001:db8::1]:8080") or brackets, and returns
+     * the bare IP, or null if it is not one. Never resolves a host name: IPv4 is matched by
+     * pattern, and InetAddress only sees strings with ':' made of hex digits, which it parses
+     * as an IPv6 literal (or rejects) without DNS.
+     */
+    static String bareIp(String v) {
+        if (v == null) return null;
+        v = v.trim();
+        if (v.startsWith("[")) {
+            int end = v.indexOf(']');
+            String rest = end < 0 ? null : v.substring(end + 1);
+            if (rest == null || !(rest.isEmpty() || rest.matches(":\\d+"))) return null;
+            v = v.substring(1, end);
+        } else if (v.indexOf(':') > 0 && v.indexOf(':') == v.lastIndexOf(':')) {
+            v = v.substring(0, v.indexOf(':'));
+        }
+        if (IPV4.matcher(v).matches()) return v;
+        if (v.indexOf(':') < 0 || !IPV6_CHARS.matcher(v).matches()) return null;
+        try {
+            InetAddress.getByName(v);
+            return v;
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private String sha256Hex(byte[] data) {
